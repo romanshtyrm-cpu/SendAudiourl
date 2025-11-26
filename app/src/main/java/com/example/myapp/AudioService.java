@@ -13,7 +13,7 @@ public class AudioService extends Service {
     public void onCreate() {
         super.onCreate();
         server = new AudioHttpServer();
-        server.startAutoPort();
+        server.startServer(12345);
     }
 
     @Override
