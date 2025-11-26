@@ -1,123 +1,111 @@
+package com.example.sendaudio;
 
-package com.example.myapp;
+import android.util.Log;
 
-import android.media.AudioFormat;
-import android.media.AudioRecord;
-import android.media.MediaRecorder;
-
-import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 
 public class AudioHttpServer {
 
-    private static final int SAMPLE_RATE = 16000;
-    private static final int CHANNEL = AudioFormat.CHANNEL_IN_MONO;
-    private static final int FORMAT = AudioFormat.ENCODING_PCM_16BIT;
+    private static final String TAG = "AudioHttpServer";
 
-    private volatile boolean running = false;
-    private Thread serverThread;
-    private int usedPort = 8080;
+    private ServerSocket serverSocket;
+    private boolean isRunning = false;
 
-    private int findFreePort(int startPort) {
-        int port = startPort;
-        while (port < 9000) {
-            try {
-                ServerSocket socket = new ServerSocket(port);
-                socket.close();
-                return port;
-            } catch (Exception ignored) {
-                port++;
-            }
-        }
-        return startPort;
-    }
-
-    public int startAutoPort() {
-        usedPort = findFreePort(8080);
-        startServer(usedPort);
-        return usedPort;
-    }
+    // Последний принятый аудиопоток
+    private volatile InputStream lastClientStream;
 
     public void startServer(int port) {
-        if (running) return;
-        running = true;
+        isRunning = true;
 
-        serverThread = new Thread(() -> {
+        new Thread(() -> {
             try {
-                ServerSocket serverSocket = new ServerSocket(port);
+                serverSocket = new ServerSocket(port);
+                Log.d(TAG, "HTTP Server started at port " + port);
 
-                while (running) {
+                while (isRunning) {
                     Socket client = serverSocket.accept();
-                    new Thread(() -> handleClient(client)).start();
+
+                    String request = readHeaders(client.getInputStream());
+
+                    if (request.contains("POST /stream")) {
+                        handleIncomingAudio(client);
+                    } else if (request.contains("GET /stream")) {
+                        handleAudioRequest(client);
+                    }
                 }
 
-            } catch (IOException e) {
-                e.printStackTrace();
+            } catch (Exception e) {
+                Log.e(TAG, "Server error: " + e.getMessage(), e);
             }
-        });
-
-        serverThread.start();
+        }).start();
     }
 
     public void stopServer() {
-        running = false;
-        if (serverThread != null) serverThread.interrupt();
-    }
-
-    private void handleClient(Socket client) {
+        isRunning = false;
         try {
-            OutputStream out = client.getOutputStream();
-
-            out.write(("HTTP/1.0 200 OK\r\n" +
-                    "Content-Type: audio/wav\r\n" +
-                    "Cache-Control: no-cache\r\n" +
-                    "Connection: close\r\n\r\n").getBytes());
-
-            writeWavHeader(out);
-
-            int bufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, FORMAT);
-            AudioRecord recorder = new AudioRecord(MediaRecorder.AudioSource.MIC,
-                    SAMPLE_RATE, CHANNEL, FORMAT, bufferSize);
-
-            byte[] buffer = new byte[bufferSize];
-
-            recorder.startRecording();
-
-            while (running) {
-                int read = recorder.read(buffer, 0, buffer.length);
-                if (read > 0) {
-                    out.write(buffer, 0, read);
-                }
-            }
-
-            recorder.stop();
-            recorder.release();
-
-            client.close();
-
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+            if (serverSocket != null) serverSocket.close();
+        } catch (Exception ignored) {}
     }
 
-    private void writeWavHeader(OutputStream out) throws IOException {
-        int byteRate = SAMPLE_RATE * 2;
+    // Читаем HTTP заголовки
+    private String readHeaders(InputStream in) throws Exception {
+        StringBuilder builder = new StringBuilder();
+        int prev = 0, cur;
 
-        byte[] header = new byte[44];
-        header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
-        header[4] = header[5] = header[6] = header[7] = (byte) 0xFF;
-        header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
-        header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
-        header[16] = 16; header[20] = 1; header[22] = 1;
-        header[24] = (byte)(SAMPLE_RATE & 0xff);
-        header[25] = (byte)((SAMPLE_RATE >> 8) & 0xff);
-        header[28] = (byte)(byteRate & 0xff);
-        header[29] = (byte)((byteRate >> 8) & 0xff);
-        header[32] = 2; header[34] = 16;
-        header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
-        header[40] = header[41] = header[42] = header[43] = (byte)0xFF;
-        out.write(header);
+        while ((cur = in.read()) != -1) {
+            builder.append((char) cur);
+            if (prev == '\r' && cur == '\n') {
+                if (builder.toString().endsWith("\r\n\r\n")) break;
+            }
+            prev = cur;
+        }
+
+        return builder.toString();
+    }
+
+    // Поток приходит с первого телефона (POST)
+    private void handleIncomingAudio(Socket client) {
+        new Thread(() -> {
+            try {
+                lastClientStream = client.getInputStream(); // сохраняем входящий поток
+                byte[] buffer = new byte[4096];
+
+                // читаем, но не сохраняем — поток передаётся напрямую второму клиенту
+                while (isRunning && lastClientStream.read(buffer) != -1) {}
+
+            } catch (Exception ignored) {
+            }
+        }).start();
+    }
+
+    // Второй телефон запрашивает звук (GET)
+    private void handleAudioRequest(Socket client) {
+        new Thread(() -> {
+            try {
+                OutputStream output = client.getOutputStream();
+
+                output.write((
+                        "HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: audio/pcm\r\n" +
+                        "Connection: close\r\n" +
+                        "\r\n"
+                ).getBytes());
+
+                byte[] buffer = new byte[4096];
+
+                while (isRunning && lastClientStream != null) {
+                    int read = lastClientStream.read(buffer);
+                    if (read > 0) output.write(buffer, 0, read);
+                }
+
+                client.close();
+
+            } catch (Exception e) {
+                Log.e(TAG, "Error while streaming audio: " + e.getMessage(), e);
+            }
+        }).start();
     }
 }
