@@ -1,4 +1,4 @@
-package com.example.sendaudio;
+package com.example.myapp;
 
 import android.util.Log;
 
